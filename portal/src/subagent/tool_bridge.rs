@@ -10,7 +10,12 @@ use subtle::ConstantTimeEq;
 const ALLOWED: &[&str] = &["portal_exec", "portal_process", "portal_file_read", "portal_file_write", "portal_file_edit", "portal_file_list", "portal_search", "portal_web_fetch"];
 pub struct ToolBridge { pub port: u16, pub token: String, pub extension: PathBuf, task: JoinHandle<()>, host: ToolHost }
 impl ToolBridge {
-    pub fn start(mut config: PortalConfig, handler: Arc<dyn ClientHandler>, scene: Option<String>, directory: PathBuf)
+    pub fn start(config: PortalConfig, handler: Arc<dyn ClientHandler>, scene: Option<String>, directory: PathBuf)
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self>> + Send>> {
+        Self::start_for_member(config, handler, scene, directory, None)
+    }
+    pub fn start_for_member(mut config: PortalConfig, handler: Arc<dyn ClientHandler>, scene: Option<String>, directory: PathBuf,
+        member: Option<(Arc<super::SubagentManager>, String, String)>)
         -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self>> + Send>> {
       Box::pin(async move {
         config.subagent.enabled = false;
@@ -19,11 +24,19 @@ impl ToolBridge {
         config.tools.custom_tools_enabled = false;
         let runtime = crate::tools::status::RuntimeStatus::for_bridge(&config);
         let host = ToolHost::new_with_runtime(&config, runtime).with_client_handler(handler);
-        let definitions: Vec<_> = host.list_tools().await.into_iter().filter(|t| ALLOWED.contains(&t.name.as_str()))
+        let mut definitions: Vec<_> = host.list_tools().await.into_iter().filter(|t| ALLOWED.contains(&t.name.as_str()))
             .map(|t| json!({"name":t.name,"description":t.description,"inputSchema":t.input_schema})).collect();
+        if member.is_some() { let tool=super::team::tool(); definitions.push(json!({"name":tool.name,"description":tool.description,"inputSchema":tool.input_schema})); }
         tokio::fs::create_dir_all(&directory).await?;
         let extension = directory.join(format!("tool-bridge-{}.mjs", uuid::Uuid::new_v4()));
-        let source = include_str!("tool_bridge.mjs").replace("/*PORTAL_TOOL_DEFINITIONS*/[]", &serde_json::to_string(&definitions)?);
+        let mailbox = if let Some((manager, task, agent)) = &member {
+            let book = manager.team.lock().await;
+            let after = book.tasks.iter().find(|t| t.id == *task).and_then(|t|t.agents.iter().find(|a|a.id==*agent)).and_then(|a|a.runs.last()).map_or(0, |r|r.message_cursor);
+            json!({"task_id":task,"agent_id":agent,"after":after})
+        } else { Value::Null };
+        let source = include_str!("tool_bridge.mjs")
+            .replace("/*PORTAL_TOOL_DEFINITIONS*/[]", &serde_json::to_string(&definitions)?)
+            .replace("/*PORTAL_TEAM_MAILBOX*/null", &mailbox.to_string());
         tokio::fs::write(&extension, source).await?;
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
@@ -37,7 +50,7 @@ impl ToolBridge {
                     connection = listener.accept() => {
                         let Ok((stream, _)) = connection else { break; };
                         if calls.len() >= 4 { drop(stream); continue; }
-                        let host = host.clone(); let token = expected.clone(); let scene = scene.clone();
+                        let host = host.clone(); let token = expected.clone(); let scene = scene.clone(); let member = member.clone();
                         calls.spawn(async move {
                             let (read, mut write) = stream.into_split();
                             let mut reader = BufReader::new(read);
@@ -49,6 +62,15 @@ impl ToolBridge {
                             let provided = value["token"].as_str().unwrap_or("");
                             if !bool::from(provided.as_bytes().ct_eq(token.as_bytes())) { return; }
                             let name = value["tool"].as_str().unwrap_or("");
+                            if name == "portal_team" {
+                                let Some((manager, task, agent))=member else{return;};
+                                let result=manager.team_command(value["arguments"].clone(),Some((&task,&agent))).await;
+                                let response=match result {
+                                    Ok(data)=>json!({"content":[{"type":"text","text":data.to_string()}],"isError":false}),
+                                    Err(e)=>json!({"content":[{"type":"text","text":e.to_string()}],"isError":true}),
+                                };
+                                let _=write.write_all(format!("{response}\n").as_bytes()).await;return;
+                            }
                             if !ALLOWED.contains(&name) || !value["arguments"].is_object() { return; }
                             let mut closed = [0];
                             let result = tokio::select! {

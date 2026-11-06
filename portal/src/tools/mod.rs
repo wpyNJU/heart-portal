@@ -13,7 +13,7 @@ mod screenshot;
 mod search;
 mod security;
 pub(crate) mod status;
-mod subagent;
+pub(crate) mod subagent;
 pub(crate) mod text;
 #[cfg(test)]
 mod utf8_tests;
@@ -605,6 +605,7 @@ impl ToolHost {
         // is setup, which is how a missing pi gets installed.
         if self.subagent.is_available() {
             tools.extend(subagent::list_tools());
+            tools.push(crate::subagent::team::tool());
         } else if self.subagent.setup_offered() {
             tools.push(subagent::setup_tool());
         }
@@ -711,6 +712,14 @@ impl ToolHost {
 
         // Built-in tools
         match tool_name {
+            "portal_team" => {
+                let mut args = arguments;
+                if args["scene_id"].is_null() { if let Some(scene) = scene_id { args["scene_id"] = scene.into(); } }
+                match self.subagent.team_command(args, None).await {
+                    Ok(value) => Ok(serde_json::json!({"content":[{"type":"text","text":value.to_string()}],"isError":false})),
+                    Err(error) => Ok(serde_json::json!({"content":[{"type":"text","text":error.to_string()}],"isError":true})),
+                }
+            },
             "portal_exec" => {
                 if !self.config.tools.exec {
                     anyhow::bail!("portal_exec is disabled in configuration");

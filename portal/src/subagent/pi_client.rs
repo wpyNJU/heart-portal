@@ -241,7 +241,8 @@ impl PiClient {
         }
         trace!("pi → {name} ({id})");
 
-        match time::timeout(timeout, rx).await {
+        let response = if timeout.is_zero() { Ok(rx.await) } else { time::timeout(timeout, rx).await };
+        match response {
             Ok(Ok(resp)) => resp.into_data(),
             Ok(Err(_)) => {
                 anyhow::bail!("pi daemon closed the connection while running {name}")

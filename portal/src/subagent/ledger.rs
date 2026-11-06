@@ -76,6 +76,8 @@ pub struct SessionRecord {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TaskRecord {
+    pub brief: String,
+    pub result: Option<String>,
     pub task_id: String,
     pub session: String,
     pub brief_head: String,
@@ -267,6 +269,7 @@ impl Ledger {
         scene_id: Option<&str>,
     ) {
         self.tasks.push(TaskRecord {
+            brief: brief.to_owned(),
             task_id: task_id.to_string(),
             session: session.to_string(),
             brief_head: head(brief, BRIEF_HEAD_BYTES),

@@ -62,6 +62,9 @@ use crate::tools::ToolHost;
     about = "Heart Portal — Being's gateway to the world"
 )]
 struct Cli {
+    /// Machine-readable runtime features, without starting Portal.
+    #[arg(long)]
+    capabilities: bool,
     /// Prepare the stable user installation for OS installers without starting it
     #[arg(long, hide = true)]
     install_user_runtime: bool,
@@ -187,6 +190,10 @@ async fn main() -> Result<()> {
     }
     let runtime_started = std::time::Instant::now();
     let cli = Cli::parse();
+    if cli.capabilities {
+        println!("{}", serde_json::json!({"version":PORTAL_VERSION,"team_protocol":1,"windows_subagent":"stdio-agent-end","team_messages":"turn-boundary"}));
+        return Ok(());
+    }
     #[cfg(windows)]
     if let Some(Commands::SandboxRun { payload }) = &cli.command {
         match windows_sandbox::run_payload(payload) {
@@ -562,6 +569,8 @@ async fn main() -> Result<()> {
             ));
         }
     }
+
+    let _team_server = subagent::team_server::TeamServer::start(std::sync::Arc::clone(&tool_host.subagent)).await?;
 
     if config.kits_enabled {
         tool_host.start_kit_refresh_task();

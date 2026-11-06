@@ -9,7 +9,7 @@
 //! through Portal's callback. That asymmetry is the whole point — the being
 //! and the sub-agent alternate instead of one blocking on the other.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -76,9 +76,9 @@ pub fn list_tools() -> Vec<ToolInfo> {
                     "budget": {
                         "type": "object",
                         "properties": {
-                            "max_turns": {"type": "integer", "minimum": 1},
-                            "max_tokens": {"type": "integer", "minimum": 1000},
-                            "timeout_secs": {"type": "integer", "minimum": 30, "maximum": 21600}
+                            "max_turns": {"type": "integer", "minimum": 0, "description": "0 means unlimited"},
+                            "max_tokens": {"type": "integer", "minimum": 0, "description": "0 means unlimited"},
+                            "timeout_secs": {"type": "integer", "minimum": 0, "maximum": 21600, "description": "0 disables the time limit"}
                         },
                         "description": "Caps for this task; defaults from portal.toml [subagent.budget]."
                     },
@@ -378,7 +378,7 @@ async fn setup(manager: &Arc<SubagentManager>, arguments: Value) -> Result<Value
 
 /// Per-task budget: config defaults with the being's overrides, clamped to the
 /// schema's limits so a typo cannot pin the machine for six hours.
-fn parse_budget(default: Budget, raw: Option<&Value>) -> Result<Budget> {
+pub(crate) fn parse_budget(default: Budget, raw: Option<&Value>) -> Result<Budget> {
     let Some(obj) = raw else {
         return Ok(default);
     };
@@ -391,13 +391,13 @@ fn parse_budget(default: Budget, raw: Option<&Value>) -> Result<Budget> {
 
     let mut budget = default;
     if let Some(v) = obj.get("max_turns").and_then(value_as_u64) {
-        budget.max_turns = (v as u32).max(MIN_MAX_TURNS);
+        budget.max_turns = if v == 0 { 0 } else { u32::try_from(v).context("max_turns exceeds u32")?.max(MIN_MAX_TURNS) };
     }
     if let Some(v) = obj.get("max_tokens").and_then(value_as_u64) {
-        budget.max_tokens = v.max(MIN_MAX_TOKENS);
+        budget.max_tokens = if v == 0 { 0 } else { v.max(MIN_MAX_TOKENS) };
     }
     if let Some(v) = obj.get("timeout_secs").and_then(value_as_u64) {
-        budget.timeout_secs = v.clamp(MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS);
+        budget.timeout_secs = if v == 0 { 0 } else { v.clamp(MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS) };
     }
     Ok(budget)
 }
@@ -677,7 +677,7 @@ mod tests {
             Some(&json!({"max_turns": 0, "max_tokens": 1, "timeout_secs": 999_999})),
         )
         .unwrap();
-        assert_eq!(clamped.max_turns, MIN_MAX_TURNS);
+        assert_eq!(clamped.max_turns, 0);
         assert_eq!(clamped.max_tokens, MIN_MAX_TOKENS);
         assert_eq!(clamped.timeout_secs, MAX_TIMEOUT_SECS);
 
@@ -686,6 +686,8 @@ mod tests {
         assert_eq!(coerced.timeout_secs, 300);
 
         assert!(parse_budget(default, Some(&json!("nope"))).is_err());
+        let unlimited = parse_budget(default, Some(&json!({"max_turns":0,"max_tokens":0,"timeout_secs":0}))).unwrap();
+        assert_eq!((unlimited.max_turns, unlimited.max_tokens, unlimited.timeout_secs), (0, 0, 0));
     }
 
     #[tokio::test]

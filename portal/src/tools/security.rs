@@ -87,7 +87,7 @@ pub fn decide(mode: PermissionMode, name: &str) -> Decision {
     // Only reserved built-ins qualify. External tools and their annotations are untrusted.
     if matches!(name, "portal_status" | "portal_file_read" | "portal_file_list" |
         "portal_search" | "portal_kits_status" | "portal_kits_setup" | "portal_permissions" |
-        "portal_subagent_status" | "portal_subagent_log" | "portal_subagent_spawn" | "portal_subagent_control") {
+        "portal_subagent_status" | "portal_subagent_log" | "portal_subagent_spawn" | "portal_subagent_control" | "portal_team") {
         return Decision::Allow;
     }
     if mode == PermissionMode::ReadOnly { return Decision::Deny; }

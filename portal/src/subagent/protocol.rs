@@ -597,6 +597,8 @@ impl PromptComplete {
 /// did the work must not be reported as failed over a stray line.
 #[derive(Debug, Clone, Default)]
 pub struct StdioResult {
+    /// A successful process exit is not proof that the Agent finished.
+    pub completed: bool,
     pub last_assistant_text: Option<String>,
     pub stop_reason: Option<String>,
     pub error_message: Option<String>,
@@ -638,6 +640,7 @@ impl StdioResult {
             }
             "turn_end" => self.turns = self.turns.saturating_add(1),
             "agent_end" => {
+                self.completed = true;
                 // Belt and braces: a pi that emits no per-message events (or a
                 // capture we joined late) still carries everything here.
                 if self.last_assistant_text.is_none() {

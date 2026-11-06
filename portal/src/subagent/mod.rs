@@ -23,6 +23,8 @@ pub mod pi_client;
 pub mod pi_daemon;
 pub mod protocol;
 pub mod transcript;
+pub mod team;
+pub mod team_server;
 mod tool_bridge;
 
 use anyhow::{Context, Result};
@@ -424,6 +426,7 @@ struct TaskOutcome {
 // ── manager ─────────────────────────────────────────────────────────
 
 pub struct SubagentManager {
+    team: AsyncMutex<team::TeamBook>,
     portal_config: PortalConfig,
     approval_handler: StdMutex<Arc<dyn crate::tools::client::ClientHandler>>,
     /// Everything but `[subagent.model]`, which lives in `model` because the
@@ -519,6 +522,7 @@ impl SubagentManager {
         let max_concurrent = sub.max_concurrent.max(1);
 
         Arc::new(Self {
+            team: AsyncMutex::new(team::TeamBook::load(state_dir.join("teams.json"))),
             portal_config: config.clone(),
             approval_handler: StdMutex::new(Arc::new(crate::tools::client::NoClientHandler)),
             model: StdMutex::new(sub.model.clone()),
@@ -1042,6 +1046,10 @@ impl SubagentManager {
     /// Delegate a task. Returns as soon as the prompt is in flight; the result
     /// is delivered to Heart's callback inbox (PRD §4.3).
     pub async fn spawn(self: &Arc<Self>, req: SpawnRequest) -> Result<SpawnReceipt> {
+        self.spawn_admitted(req, None).await
+    }
+
+    async fn spawn_admitted(self: &Arc<Self>, req: SpawnRequest, ticket: Option<String>) -> Result<SpawnReceipt> {
         self.ensure_available()?;
         if self.shutting_down.load(Ordering::SeqCst) {
             anyhow::bail!("Portal is shutting down");
@@ -1064,21 +1072,25 @@ impl SubagentManager {
         let key = normalize_session_key(&req.session)?;
         let workdir = self.resolve_workdir(req.workdir.as_deref())?;
 
-        // Serialize spawns per session key for the whole check-and-set window.
-        let _spawn_guard = self.begin_spawn(&key)?;
 
         // Capacity before anything is started, so a refusal costs nothing.
-        let permit = Arc::clone(&self.running)
-            .try_acquire_owned()
+        let permit = if ticket.is_some() { Arc::clone(&self.running).acquire_owned().await.map_err(|_| anyhow::anyhow!("Portal is shutting down"))? }
+        else { Arc::clone(&self.running).try_acquire_owned()
             .map_err(|_| {
                 anyhow::anyhow!(
                     "{}/{} sub-agent tasks already running; wait for one to finish",
                     self.config.max_concurrent,
                     self.config.max_concurrent
                 )
-            })?;
+            })? };
+        anyhow::ensure!(!self.shutting_down.load(Ordering::SeqCst), "Portal is shutting down");
 
-        let transport = self.transport().await?;
+        let _spawn_guard = self.begin_spawn(&key)?;
+        if let Some(ticket) = ticket.as_deref() { self.check_team_ticket(&key, ticket).await?; }
+        let transport = if ticket.is_some() {
+            self.prepare_custom_model()?;
+            Transport::Stdio
+        } else { self.transport().await? };
         let (session, resumed) = self
             .ensure_session(&transport, &key, &workdir, &req)
             .await?;
@@ -1125,6 +1137,11 @@ impl SubagentManager {
             .append_line(&format!("[start] task {} — {}", task.task_id, head(&brief, 120)))
             .await;
 
+        if let Err(error) = self.team_run_started(&task, ticket.as_deref()).await {
+            session.inner.lock().await.busy_task = None;
+            self.finalize(&session, &task, TaskStatus::Cancelled, TaskOutcome::default()).await;
+            return Err(error);
+        }
         let manager = Arc::clone(self);
         let run_task = Arc::clone(&task);
         let run_session = Arc::clone(&session);
@@ -1230,7 +1247,9 @@ impl SubagentManager {
                 );
             }
             if session.inner.lock().await.active_session_id.is_some() {
-                return Ok((session, true));
+                let resumed = !matches!(transport, Transport::Stdio)
+                    || session.inner.lock().await.session_file.as_ref().is_some_and(|p| Path::new(p).is_file());
+                return Ok((session, resumed));
             }
             let resumed = self.open_pi_session(transport, &session, req).await?;
             return Ok((session, resumed));
@@ -1377,28 +1396,36 @@ impl SubagentManager {
         Ok(resumed)
     }
 
-    /// The stdio stand-in for `open_pi_session`. There is nothing to create:
-    /// each task brings its own process. The session still exists as Portal
-    /// bookkeeping — a cwd, a transcript, a busy flag, a ledger row — so
-    /// everything the being can ask about a task keeps working.
+    /// A member keeps one official pi session file across short-lived processes.
+    /// Legacy non-team spawns retain their transient stdio behavior.
     async fn open_stdio_session(self: &Arc<Self>, session: &Arc<SessionState>) -> Result<bool> {
+        let session_file = if self.team_identity(&session.key).await.is_some() {
+            Some(self.member_session_file(&session.key))
+        } else {
+            None
+        };
+        let resumed = session_file.as_ref().is_some_and(|path| path.is_file());
         {
             let mut inner = session.inner.lock().await;
             inner.active_session_id = Some(format!("{STDIO_SESSION_PREFIX}{}", session.key));
+            inner.session_file = session_file.as_ref().map(|path| path.display().to_string());
             inner.attached = false;
             inner.last_used = time::Instant::now();
         }
         {
             let mut ledger = self.ledger.lock().await;
-            ledger.upsert_session(&session.key, &session.cwd.display().to_string(), None);
+            ledger.upsert_session(&session.key, &session.cwd.display().to_string(), session_file.as_ref().map(|path| path.to_string_lossy()).as_deref());
             ledger.save_lossy();
         }
         info!(
-            "session '{}' runs over stdio: one pi process per task, no shared context",
-            session.key
+            "session '{}' runs over stdio (persistent team context: {})",
+            session.key, session_file.is_some()
         );
-        // Never "resumed": a fresh process carries nothing of the last task.
-        Ok(false)
+        Ok(resumed)
+    }
+
+    pub(super) fn member_session_file(&self, member: &str) -> PathBuf {
+        self.daemon().sessions_dir().join(format!("{member}.jsonl"))
     }
 
     /// Fail the first spawn loudly rather than letting every task die on a
@@ -1484,6 +1511,7 @@ impl SubagentManager {
         let spec = StdioTask {
             max_turns: task.budget.max_turns,
             max_tokens: task.budget.max_tokens,
+            session_file: session.inner.lock().await.session_file.as_ref().map(PathBuf::from),
             prompt: message,
             workdir: task.workdir.clone(),
             provider: choice.provider,
@@ -1498,11 +1526,12 @@ impl SubagentManager {
         let config = self.portal_config.clone();
         let handler = self.approval_handler.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let scene = task.scene_id.clone();
+        let member = self.team_identity(&task.session_key).await.map(|(task,agent)|(Arc::clone(&self),task,agent));
         let mut handle = tokio::spawn(async move {
-            if config.security.permission_mode == crate::config::PermissionMode::FullAccess {
+            if config.security.permission_mode == crate::config::PermissionMode::FullAccess && member.is_none() {
                 return daemon.run_stdio_task(spec).await;
             }
-            let bridge = tool_bridge::ToolBridge::start(config, handler, scene, daemon.agent_dir().join("portal-tools")).await?;
+            let bridge = tool_bridge::ToolBridge::start_for_member(config, handler, scene, daemon.agent_dir().join("portal-tools"), member).await?;
             daemon.run_stdio_task_with_bridge(spec, Some(&bridge)).await
         });
 
@@ -1591,7 +1620,9 @@ impl SubagentManager {
         active_session_id: String,
         message: String,
     ) {
-        let timeout = Duration::from_secs(task.budget.timeout_secs) + PROMPT_TIMEOUT_SLACK;
+        let timeout = if task.budget.timeout_secs == 0 { Duration::ZERO } else {
+            Duration::from_secs(task.budget.timeout_secs) + PROMPT_TIMEOUT_SLACK
+        };
         let prompt = PromptRequest {
             active_session_id: active_session_id.clone(),
             message,
@@ -1760,7 +1791,7 @@ impl SubagentManager {
                             Command::WaitForIdle {
                                 active_session_id: active_session_id.to_string(),
                             },
-                            Duration::from_secs(task.budget.timeout_secs.max(60)),
+                            if task.budget.timeout_secs == 0 { Duration::ZERO } else { Duration::from_secs(task.budget.timeout_secs.max(60)) },
                         )
                         .await;
                     if idle.is_ok() {
@@ -1844,6 +1875,9 @@ impl SubagentManager {
                 usage.total,
                 outcome.error.as_deref(),
             );
+            if let Some(record) = ledger.tasks.iter_mut().find(|record|record.task_id == task.task_id) {
+                record.result = outcome.text.as_deref().map(|text| clamp_str(text, 16384));
+            }
             if cancelled {
                 ledger.set_callback_state(&task.task_id, LedgerCallbackState::Suppressed);
             }
@@ -1863,6 +1897,7 @@ impl SubagentManager {
             ))
             .await;
 
+        self.team_run_finished(task, status, outcome.text.as_deref(), outcome.error.as_deref(), turns, usage.total).await;
         if cancelled {
             debug!(
                 "task {} was cancelled; callback suppressed",
@@ -1911,6 +1946,7 @@ impl SubagentManager {
         let full = outcome.text.clone().unwrap_or_default();
         let usage = outcome.usage;
         let brief = clamp_str(&task.brief, CALLBACK_COMMAND_MAX_BYTES);
+        let member = self.team_identity(&task.session_key).await;
 
         fit_payload(|max_output| {
             let result = clamp_str_tail(&full, max_output);
@@ -1927,6 +1963,8 @@ impl SubagentManager {
                 ),
                 "result": {
                     "kind": "subagent",
+                    "team_task_id": member.as_ref().map(|(task,_)|task),
+                    "agent_id": member.as_ref().map(|(_,agent)|agent),
                     "task_id": task.task_id,
                     "session": task.session_key,
                     "status": status.as_str(),
@@ -2411,6 +2449,7 @@ impl SubagentManager {
             return;
         }
         self.shutting_down.store(true, Ordering::SeqCst);
+        self.running.close();
 
         let tasks: Vec<Arc<TaskState>> = self.tasks.lock().await.values().cloned().collect();
         let client = self.daemon().client().await;
@@ -2541,14 +2580,15 @@ async fn classify(task: &Arc<TaskState>, outcome: &TaskOutcome, value: &Value) -
 
 /// The prompt a task becomes inside its session (PRD §7.1).
 fn render_prompt(task: &TaskState, brief: &str) -> String {
+    let limit = |value: u64, unit: &str| if value == 0 { format!("unlimited {unit}") } else { format!("≤{value} {unit}") };
     format!(
-        "# Task {} (session {})\nWorking directory: {}\nBudget: ≤{} turns, ≤{} tokens, ≤{} min\n\n{}",
+        "# Task {} (session {})\nWorking directory: {}\nBudget: {}, {}, {}\n\n{}",
         task.task_id,
         task.session_key,
         task.workdir.display(),
-        task.budget.max_turns,
-        task.budget.max_tokens,
-        task.budget.timeout_secs / 60,
+        limit(task.budget.max_turns as u64, "turns"),
+        limit(task.budget.max_tokens, "tokens"),
+        if task.budget.timeout_secs == 0 { "unlimited time".into() } else { format!("≤{} sec", task.budget.timeout_secs) },
         brief
     )
 }
@@ -2678,7 +2718,7 @@ exit /b 0
             let launch = launch.unwrap();
             assert!(!workspace.join("unexpected-command.txt").exists(), "daemon commands reached stock RPC");
             let probes = std::fs::read_to_string(workspace.join("rpc-probes.txt")).unwrap_or_default();
-            assert_eq!(probes.lines().count(), usize::from(mode == PermissionMode::FullAccess), "RPC must be probed at most once");
+            assert_eq!(probes.lines().count(), 0, "Windows must use per-task stdio without an RPC probe");
             drop(task);
             drop(manager);
             // Windows may retain a sharing lock briefly after process exit.
@@ -2694,7 +2734,8 @@ exit /b 0
             }
             let restricted = mode != PermissionMode::FullAccess;
             assert_eq!(broker.unwrap().trim(), if restricted { "true" } else { "false" });
-            for flag in ["--no-tools", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-session", "--extension"] {
+            assert!(launch.split_whitespace().any(|arg|arg=="--no-session"));
+            for flag in ["--no-tools", "--no-extensions", "--no-skills", "--no-prompt-templates", "--extension"] {
                 assert_eq!(launch.split_whitespace().any(|arg| arg == flag), restricted, "{mode:?}: {flag}: {launch}");
             }
         }
@@ -3014,8 +3055,14 @@ exit /b 0
         assert!(prompt.starts_with("# Task sub_1 (session scene-42)"), "{prompt}");
         assert!(prompt.contains("Working directory: /ws/proj"));
         assert!(prompt.contains("≤40 turns"));
-        assert!(prompt.contains("≤30 min"));
+        assert!(prompt.contains("≤1800 sec"));
         assert!(prompt.ends_with("Refactor the auth module"));
+        let mut task = task;
+        task.budget.max_turns = 0;
+        task.budget.max_tokens = 0;
+        task.budget.timeout_secs = 0;
+        let prompt = render_prompt(&task, "Continue");
+        assert!(prompt.contains("unlimited turns, unlimited tokens, unlimited time"));
     }
 
     #[test]

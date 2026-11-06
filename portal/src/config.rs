@@ -205,6 +205,7 @@ pub struct SubagentConfig {
 /// Per-task caps, mapped onto pi's own `autonomous` budget primitives.
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub struct BudgetConfig {
+    /// Zero disables the turn, token or time limit respectively.
     #[serde(default = "default_max_turns")]
     pub max_turns: u32,
     #[serde(default = "default_max_tokens")]

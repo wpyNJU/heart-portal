@@ -310,6 +310,12 @@ impl PiDaemon {
     /// per-task stdio mode — permanently, for this process — the first time a
     /// daemon start shows that this pi has no daemon mode.
     pub async fn ensure_transport(&self) -> Result<Transport> {
+        // Stock pi RPC is not the prime-agent daemon protocol. Windows uses
+        // the native task runner; never probe it by issuing daemon commands.
+        if cfg!(windows) {
+            self.state.lock().await.mode = TransportMode::Stdio;
+            return Ok(Transport::Stdio);
+        }
         if self.transport_mode().await == TransportMode::Stdio {
             return Ok(Transport::Stdio);
         }
@@ -429,7 +435,7 @@ impl PiDaemon {
             cmd.env(env_name, key);
         }
         cmd.env("PI_CODING_AGENT_DIR", self.agent_dir())
-            .env("PORTAL_SUBAGENT_API_KEY", self.config.api_key.as_deref().unwrap_or("portal-keyless"))
+            .env("PORTAL_SUBAGENT_API_KEY", resolved_api_key(self.config.api_key.as_deref(), self.config.provider.as_deref(), |name| std::env::var(name).ok()).unwrap_or_else(|| "portal-keyless".into()))
             .env("PRIME_AGENT_CODING_AGENT_DIR", self.agent_dir())
             .env("PRIME_AGENT_SESSION_DIR", self.sessions_dir())
             // pi change P1: exit gracefully when Portal's stdin pipe closes.
@@ -621,8 +627,9 @@ impl PiDaemon {
 
     /// Run one task as its own `pi --print --mode json` process.
     ///
-    /// This is the whole of the stdio fallback: no daemon, no session reuse,
-    /// no steering. The prompt goes in as a positional message (`--print` is
+    /// This transport has no daemon or in-flight steering. Team members use
+    /// their own persisted pi session; ordinary fallback tasks remain transient.
+    /// The prompt goes in as a positional message (`--print` is
     /// a flag, not an option that takes one), pi's JSONL lands on stdout and
     /// is folded into a [`StdioResult`] as it streams, and its human-readable
     /// noise on stderr is appended to the same `daemon.log`.
@@ -644,8 +651,13 @@ impl PiDaemon {
         let mut cmd = TokioCommand::new(&argv[0]);
         cmd.args(&argv[1..]);
         cmd.args(["--print", "--mode", "json"]);
+        if let Some(session_file) = task.session_file.as_ref() {
+            cmd.arg("--session").arg(session_file);
+        } else {
+            cmd.arg("--no-session");
+        }
         if let Some(bridge) = bridge {
-            cmd.args(["--no-tools", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-session", "--extension"])
+            cmd.args(["--no-tools", "--no-extensions", "--no-skills", "--no-prompt-templates", "--extension"])
                 .arg(&bridge.extension);
         }
         if let Some(provider) = task.provider.as_deref() {
@@ -657,8 +669,13 @@ impl PiDaemon {
         if let Some(thinking) = task.thinking.as_deref() {
             cmd.args(["--thinking", thinking]);
         }
+        let configured_key = task.api_key.as_deref().or(self.config.api_key.as_deref());
+        let api_key = resolved_api_key(configured_key, task.provider.as_deref(), |name| std::env::var(name).ok());
+        if let Some(name) = configured_key.and_then(|key| key.strip_prefix("env:").or_else(|| (key.ends_with("_API_KEY") || key.ends_with("_TOKEN")).then_some(key))) {
+            anyhow::ensure!(api_key.is_some(), "Credential environment variable {name} is missing or empty in the Portal process");
+        }
         if task.provider.as_deref() != Some("portal-custom") {
-            if let Some(key) = task.api_key.as_deref() {
+            if let Some(key) = api_key.as_deref() {
                 cmd.args(["--api-key", key]);
             }
         }
@@ -670,7 +687,7 @@ impl PiDaemon {
             cmd.env("PORTAL_TOOL_PORT", bridge.port.to_string()).env("PORTAL_TOOL_TOKEN", &bridge.token);
         }
         cmd.env("PI_CODING_AGENT_DIR", self.agent_dir())
-            .env("PORTAL_SUBAGENT_API_KEY", task.api_key.as_deref().or(self.config.api_key.as_deref()).unwrap_or("portal-keyless"))
+            .env("PORTAL_SUBAGENT_API_KEY", api_key.as_deref().unwrap_or("portal-keyless"))
             .env("PRIME_AGENT_CODING_AGENT_DIR", self.agent_dir())
             .env("PRIME_AGENT_SESSION_DIR", self.sessions_dir())
             .env("PRIME_AGENT_HEADLESS", "1")
@@ -716,24 +733,24 @@ impl PiDaemon {
         });
         let stderr_reader = tokio::spawn(read_stderr_tail(stderr, STDIO_STDERR_TAIL_BYTES));
 
-        let wait = time::timeout(task.timeout, async {
+        let wait = async {
             #[cfg(unix)]
             { owner.wait_unreaped().await?; owner.terminate(); }
             child.wait().await
-        });
+        };
         let (exit_code, timed_out, budget_exhausted) = tokio::select! {
             Ok(()) = budget_rx => (None, false, true),
             status = wait => match status {
-            Ok(Ok(status)) => (status.code(), false, false),
-            Ok(Err(e)) => {
+            Ok(status) => (status.code(), false, false),
+            Err(e) => {
                 warn!("waiting for the pi task failed: {e}");
                 (None, false, false)
             }
-            Err(_) => {
+            },
+            _ = time::sleep(task.timeout), if !task.timeout.is_zero() => {
                 warn!("pi task exceeded {:?}; terminating", task.timeout);
                 (None, true, false)
             }
-            },
         };
         owner.terminate();
         if timed_out || budget_exhausted {
@@ -836,9 +853,10 @@ fn pi_command(program: &Path) -> Option<Vec<String>> {
     {
         let cli = if program.extension().is_some_and(|ext| ext == "js") {
             Some(program.to_path_buf())
-        } else if program.file_name().is_some_and(|name| name == "pi.cmd") {
-            program.parent().map(|dir| dir.join("node_modules/@mariozechner/pi-coding-agent/dist/cli.js"))
-                .filter(|path| path.is_file())
+        } else if program.file_name().is_some_and(|name| name == "pi.cmd" || name == "pi") {
+            program.ancestors().skip(1).take(3)
+                .flat_map(|dir| [dir.join("node_modules/@mariozechner/pi-coding-agent/dist/cli.js"), dir.join("@mariozechner/pi-coding-agent/dist/cli.js")])
+                .find(|path| path.is_file())
         } else { None };
         if let Some(cli) = cli {
             if !cli.is_file() { return None; }
@@ -847,6 +865,29 @@ fn pi_command(program: &Path) -> Option<Vec<String>> {
         }
     }
     is_executable(program).then(|| vec![program.display().to_string()])
+}
+
+/// Resolve before clearing the child environment. Explicit configuration wins;
+/// an environment reference is resolved by Portal, not by a patched pi install.
+fn resolved_api_key(configured: Option<&str>, provider: Option<&str>, env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    if let Some(value) = configured.filter(|value| !value.trim().is_empty() && *value != "portal-keyless") {
+        if let Some(name) = value.strip_prefix("env:") { return env(name).filter(|key| !key.is_empty()); }
+        if value.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_') {
+            if let Some(key) = env(value).filter(|key| !key.is_empty()) { return Some(key); }
+            if value.ends_with("_API_KEY") || value.ends_with("_TOKEN") { return None; }
+        }
+        return Some(value.to_owned());
+    }
+    let name = match provider {
+        Some("anthropic") => "ANTHROPIC_API_KEY",
+        Some("openrouter") => "OPENROUTER_API_KEY",
+        Some("groq") => "GROQ_API_KEY",
+        Some("xai") => "XAI_API_KEY",
+        Some("google" | "gemini") => "GEMINI_API_KEY",
+        _ => "OPENAI_API_KEY",
+    };
+    env("PORTAL_SUBAGENT_API_KEY").filter(|key| !key.is_empty() && key != "portal-keyless")
+        .or_else(|| env(name).filter(|key| !key.is_empty()))
 }
 
 /// `<root>/VERSION` — which pinned version the install under `root` is.
@@ -1128,6 +1169,9 @@ fn child_environment(
 pub struct StdioTask {
     pub max_turns: u32,
     pub max_tokens: u64,
+    /// Stable team-member session, owned and serialized by official pi.
+    /// None preserves the legacy one-shot fallback.
+    pub session_file: Option<PathBuf>,
     /// The full prompt, exactly as a daemon session would have received it.
     pub prompt: String,
     /// cwd for the process; the sub-agent's working directory.
@@ -1172,7 +1216,8 @@ impl StdioRun {
             ));
         }
         match self.exit_code {
-            Some(0) => None,
+            Some(0) if self.result.completed => None,
+            Some(0) => Some("pi exited before emitting agent_end; the task did not complete".into()),
             // A kill is the caller's own doing; it reports the timeout itself.
             _ if self.timed_out => None,
             Some(code) => Some(match self.stderr_tail.is_empty() {
@@ -1347,6 +1392,32 @@ fn is_executable(path: &Path) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn credentials_resolve_before_child_environment_is_cleared() {
+        let env = |name: &str| match name {
+            "SUBDENG_API_KEY" => Some("fixture-custom-key".into()),
+            "PORTAL_SUBAGENT_API_KEY" => Some("fixture-inherited-key".into()),
+            _ => None,
+        };
+        assert_eq!(resolved_api_key(Some("env:SUBDENG_API_KEY"), Some("portal-custom"), env).as_deref(), Some("fixture-custom-key"));
+        assert_eq!(resolved_api_key(Some("SUBDENG_API_KEY"), Some("portal-custom"), env).as_deref(), Some("fixture-custom-key"));
+        assert_eq!(resolved_api_key(Some("explicit-key"), Some("portal-custom"), env).as_deref(), Some("explicit-key"));
+        assert_eq!(resolved_api_key(None, Some("portal-custom"), env).as_deref(), Some("fixture-inherited-key"));
+        assert_eq!(resolved_api_key(Some("portal-keyless"), Some("portal-custom"), env).as_deref(), Some("fixture-inherited-key"));
+        assert_eq!(resolved_api_key(Some("env:MISSING_API_KEY"),None,env),None);
+        assert_eq!(resolved_api_key(Some("MISSING_API_KEY"),None,env),None);
+    }
+
+    #[test]
+    fn clean_exit_requires_agent_end() {
+        let mut run = StdioRun { result: StdioResult::default(), exit_code: Some(0), timed_out: false, budget_exhausted: false, stderr_tail: String::new() };
+        assert!(run.error().unwrap().contains("agent_end"));
+        run.result.fold_line(r#"{"type":"agent_end","messages":[]}"#);
+        assert!(run.error().is_none());
+        run.result.error_message = Some("401 INVALID_API_KEY".into());
+        assert!(run.error().unwrap().contains("401"));
+    }
+
     /// Short root: the daemon socket must fit in `sun_path` (~104 bytes) and
     /// macOS `$TMPDIR` alone is ~50.
     fn temp_dir(tag: &str) -> PathBuf {
@@ -1393,7 +1464,7 @@ mod tests {
         assert_eq!(Path::new(&resolved[1]), binary);
         assert!(!bundled_pi_wants_provisioning(Some(&resolved), &install));
         std::fs::write(install.join("pi"), "#!/bin/sh\n").unwrap();
-        assert!(pi_command(&install.join("pi")).is_none());
+        assert_eq!(pi_command(&install.join("pi")).unwrap(), resolved);
         std::fs::write(install.join("pi.cmd"), "@echo off").unwrap();
         assert_eq!(pi_command(&install.join("pi.cmd")).unwrap(), resolved);
         assert!(find_on_path("cmd").unwrap().ends_with("cmd.exe"));
@@ -1419,6 +1490,7 @@ mod tests {
             });
             let started = time::Instant::now();
             let run = daemon.run_stdio_task(StdioTask {
+                session_file: None,
                 max_turns, max_tokens, prompt: "test".into(), workdir: root.clone(),
                 provider: None, model: None, thinking: None, api_key: None,
                 timeout: Duration::from_secs(15), transcript: None,
@@ -1430,6 +1502,36 @@ mod tests {
             assert!(!root.join("next-turn").exists());
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    #[tokio::test]
+    async fn zero_stdio_budget_runs_to_terminal_event_without_a_deadline() {
+        let root = temp_dir("stdio-unlimited");
+        let message = r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"unlimited complete"}],"usage":{"input":500000,"output":10}}}"#;
+        let turns = "echo {\"type\":\"turn_end\"}\n".repeat(45);
+        #[cfg(windows)]
+        let command = {
+            let script = root.join("unlimited.cmd");
+            std::fs::write(&script, format!("@echo off\r\n\"%SystemRoot%\\System32\\ping.exe\" -n 2 127.0.0.1 >nul\r\necho {message}\r\n{turns}echo {{\"type\":\"agent_end\",\"messages\":[]}}\r\n")).unwrap();
+            vec![script.display().to_string()]
+        };
+        #[cfg(unix)]
+        let command = vec!["/bin/sh".into(), "-c".into(), format!("sleep 1; printf '%s\\n' '{message}'; for i in $(seq 1 45); do printf '%s\\n' '{{\"type\":\"turn_end\"}}'; done; printf '%s\\n' '{{\"type\":\"agent_end\",\"messages\":[]}}'")];
+        let daemon = PiDaemon::new(PiDaemonConfig {
+            command, state_dir: root.join("s"), workspace_root: root.clone(),
+            env_passthrough: vec!["PATH".into()], api_key: None, provider: None,
+        });
+        let run = time::timeout(Duration::from_secs(10), daemon.run_stdio_task(StdioTask {
+            session_file: None, max_turns: 0, max_tokens: 0, prompt: "continue".into(),
+            workdir: root.clone(), provider: None, model: None, thinking: None, api_key: None,
+            timeout: Duration::ZERO, transcript: None,
+        })).await.unwrap().unwrap();
+        assert!(!run.timed_out && !run.budget_exhausted, "{run:?}");
+        assert_eq!(run.error(), None);
+        assert_eq!(run.result.turns, 45);
+        assert_eq!(run.result.usage.total, 500010);
+        assert_eq!(run.result.last_assistant_text.as_deref(), Some("unlimited complete"));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1882,6 +1984,7 @@ JSON
         let (tx, mut rx) = mpsc::unbounded_channel();
         let run = d
             .run_stdio_task(StdioTask {
+                session_file: None,
                 max_turns: 40,
                 max_tokens: 400_000,
                 prompt: "# Task sub_1\nrefactor the thing".to_string(),
@@ -1943,6 +2046,7 @@ JSON
         let started = time::Instant::now();
         let run = d
             .run_stdio_task(StdioTask {
+                session_file: None,
                 max_turns: 40,
                 max_tokens: 400_000,
                 prompt: "take too long".to_string(),
@@ -1984,6 +2088,7 @@ JSON
 
         let run = d
             .run_stdio_task(StdioTask {
+                session_file: None,
                 max_turns: 40,
                 max_tokens: 400_000,
                 prompt: "anything".to_string(),
